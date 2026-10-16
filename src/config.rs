@@ -1,8 +1,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
-use serde_derive::{Deserialize, Serialize};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use serde::{Deserialize, Serialize};
 
 use crate::compact::Compression;
 
@@ -10,6 +10,7 @@ use crate::compact::Compression;
 pub struct ConfigFile {
     backing: Option<PathBuf>,
     config: Config,
+    load_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,15 +82,25 @@ impl Default for Config {
 
 impl ConfigFile {
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
-        Self {
+        let mut new = Self {
             backing: Some(path.as_ref().to_owned()),
-            config: std::fs::read(path)
-                .and_then(|data| {
-                    serde_json::from_slice::<Config>(&data)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-                })
-                .unwrap_or_default(),
+            ..Self::default()
+        };
+
+        match std::fs::read(path) {
+            Ok(data) => match serde_json::from_slice::<Config>(&data) {
+                Ok(config) => new.config = config,
+                Err(err) => {
+                    new.load_error = Some(format!("Could not read saved settings: {err}"));
+                }
+            },
+            Err(ref err) if err.kind() == io::ErrorKind::NotFound => (),
+            Err(err) => {
+                new.load_error = Some(format!("Could not read saved settings: {err}"));
+            }
         }
+
+        new
     }
 
     pub fn save(&self) -> io::Result<()> {
@@ -110,8 +121,12 @@ impl ConfigFile {
         self.config.clone()
     }
 
-    pub fn replace(&mut self, c: Config) {
-        self.config = c;
+    pub fn load_error(&self) -> Option<&str> {
+        self.load_error.as_deref()
+    }
+
+    pub fn replace(&mut self, config: Config) {
+        self.config = config;
     }
 }
 
@@ -119,20 +134,26 @@ impl Config {
     pub fn globset(&self) -> Result<GlobSet, String> {
         let mut globs = GlobSetBuilder::new();
         for glob in &self.excludes {
-            globs.add(Glob::new(glob).map_err(|e| e.to_string())?);
+            let glob = GlobBuilder::new(glob)
+                .case_insensitive(true)
+                .build()
+                .map_err(|error| error.to_string())?;
+            globs.add(glob);
         }
-        globs.build().map_err(|e| e.to_string())
+        globs.build().map_err(|error| error.to_string())
     }
 }
 
 #[test]
 fn test_config() {
-    let s = Config::default();
+    let config = Config::default();
 
-    assert!(s.globset().is_ok());
-    let gs = s.globset().unwrap();
+    assert!(config.globset().is_ok());
+    let gs = config.globset().unwrap();
 
     assert!(gs.is_match("C:\\foo\\bar\\hmm.rar"));
     assert!(gs.is_match("C:\\Windows\\System32\\floop\\bla.txt"));
+    assert!(gs.is_match("c:\\WINDOWS\\System32\\floop\\bla.txt"));
+    assert!(gs.is_match("C:\\x\\PHOTO.JPG"));
     assert!(gs.is_match("C:\\x.lz4"));
 }

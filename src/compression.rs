@@ -1,28 +1,26 @@
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use compresstimator::Compresstimator;
 use crossbeam_channel::{Receiver, Sender};
 use filetime::FileTime;
-use fs2::FileExt;
-use winapi::um::winnt::{FILE_READ_DATA, FILE_WRITE_ATTRIBUTES};
+use windows_sys::Win32::Storage::FileSystem::{FILE_READ_DATA, FILE_WRITE_ATTRIBUTES};
 
-use crate::background::Background;
-use crate::background::ControlToken;
+use crate::background::{Background, ControlToken};
 use crate::compact::{self, Compression};
 
 #[derive(Debug)]
 pub struct BackgroundCompactor {
     compression: Option<Compression>,
-    files_in: Receiver<(PathBuf, u64)>,
+    files_in: Receiver<PathBuf>,
     files_out: Sender<(PathBuf, io::Result<bool>)>,
 }
 
 impl BackgroundCompactor {
     pub fn new(
         compression: Option<Compression>,
-        files_in: Receiver<(PathBuf, u64)>,
+        files_in: Receiver<PathBuf>,
         files_out: Sender<(PathBuf, io::Result<bool>)>,
     ) -> Self {
         Self {
@@ -33,22 +31,32 @@ impl BackgroundCompactor {
     }
 }
 
-fn handle_file(file: &PathBuf, compression: Option<Compression>) -> io::Result<bool> {
+fn lock_error(err: std::fs::TryLockError) -> io::Error {
+    match err {
+        std::fs::TryLockError::WouldBlock => io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "file is locked by another process",
+        ),
+        std::fs::TryLockError::Error(err) => err,
+    }
+}
+
+fn handle_file(path: &Path, compression: Option<Compression>) -> io::Result<bool> {
     let est = Compresstimator::with_block_size(8192);
-    let meta = std::fs::metadata(&file)?;
+    let meta = std::fs::metadata(path)?;
     let handle = std::fs::OpenOptions::new()
         .access_mode(FILE_WRITE_ATTRIBUTES | FILE_READ_DATA)
-        .open(&file)?;
+        .open(path)?;
 
-    handle.try_lock_exclusive()?;
+    handle.try_lock().map_err(lock_error)?;
 
     let ret = match compression {
-        Some(compression) => match est.compresstimate(&handle, meta.len()) {
+        Some(compression) => match est.compresstimate_len(&handle, meta.len()) {
             Ok(ratio) if ratio < 0.95 => compact::compress_file_handle(&handle, compression),
             Ok(_) => Ok(false),
-            Err(e) => Err(e),
+            Err(err) => Err(err),
         },
-        None => compact::uncompress_file_handle(&handle).map(|_| true),
+        None => compact::uncompress_file_handle(&handle).map(|()| true),
     };
 
     let _ = filetime::set_file_handle_times(
@@ -57,7 +65,7 @@ fn handle_file(file: &PathBuf, compression: Option<Compression>) -> io::Result<b
         Some(FileTime::from_last_modification_time(&meta)),
     );
 
-    handle.unlock()?;
+    let _ = handle.unlock();
 
     ret
 }
@@ -72,7 +80,6 @@ impl Background for BackgroundCompactor {
                 break;
             }
 
-            let file = file.0;
             let ret = handle_file(&file, self.compression);
             if self.files_out.send((file, ret)).is_err() {
                 break;

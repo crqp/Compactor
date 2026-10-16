@@ -1,13 +1,19 @@
 [package]
 name = "hashfilter"
-version = "0.1.0"
-authors = ["Thomas Hurst <tom@hur.st>"]
-edition = "2018"
+version = "0.2.0"
+authors = ["Thomas Hurst <tom@hur.st>", "Cirqup <skankpaw@disroot.org>"]
+edition = "2024"
+rust-version = "1.96"
 license = "MIT"
 
 [dependencies]
-fs2 = "0.4.3"
-siphasher = "0.3.0"
+siphasher = "1"
 
 [dev-dependencies]
-tempdir = "0.3.7"
+tempfile = "3"
+
+[lints.clippy]
+pedantic = "warn"
+style = "warn"
+many_single_char_names = "warn"
+min_ident_chars = "warn"

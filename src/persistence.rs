@@ -1,14 +1,12 @@
+use std::sync::{LazyLock, RwLock};
+
 use directories::ProjectDirs;
 use hashfilter::HashFilter;
-use lazy_static::lazy_static;
-use std::sync::RwLock;
 
 use crate::config::ConfigFile;
 
-lazy_static! {
-    static ref PATHDB: RwLock<HashFilter> = RwLock::new(HashFilter::default());
-    static ref CONFIG: RwLock<ConfigFile> = RwLock::new(ConfigFile::default());
-}
+static PATHDB: LazyLock<RwLock<HashFilter>> = LazyLock::new(|| RwLock::new(HashFilter::default()));
+static CONFIG: LazyLock<RwLock<ConfigFile>> = LazyLock::new(|| RwLock::new(ConfigFile::default()));
 
 pub fn init() {
     if let Some(dirs) = ProjectDirs::from("", "Freaky", "Compactor") {

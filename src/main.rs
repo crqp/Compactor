@@ -1,6 +1,5 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 #![cfg_attr(test, windows_subsystem = "console")]
-#![allow(non_snake_case)]
 
 mod backend;
 mod background;
@@ -12,15 +11,22 @@ mod folder;
 mod gui;
 mod persistence;
 
+fn short_sha() -> &'static str {
+    match option_env!("VERGEN_GIT_SHA") {
+        Some(sha) => sha.get(..8).unwrap_or(sha),
+        None => "unknown",
+    }
+}
+
 fn setup_panic() {
-    std::panic::set_hook(Box::new(|e| {
+    std::panic::set_hook(Box::new(|panic_info| {
         if !console::alloc() {
             // No point trying to print without a console...
             return;
         }
 
         println!(
-            r#"
+            r"
 Oh dear, {app} has crashed.  Sorry :(
 
 You can report this on the website at {website}/issues
@@ -31,16 +37,18 @@ you were doing - like what folder you were running it on.
 #############################################################################
 
 App: {app}, Version: {ver}, Build Date: {date}, Hash: {hash}
-"#,
+",
             app = env!("CARGO_PKG_NAME"),
             website = env!("CARGO_PKG_HOMEPAGE"),
-            ver = env!("VERGEN_SEMVER"),
-            date = env!("VERGEN_BUILD_DATE").to_string(),
-            hash = env!("VERGEN_SHA_SHORT")
+            ver = env!("CARGO_PKG_VERSION"),
+            date = option_env!("VERGEN_BUILD_DATE").unwrap_or("unknown"),
+            hash = short_sha()
         );
 
-        if let Some(s) = e.payload().downcast_ref::<&'static str>() {
-            println!("panic: {}", s);
+        if let Some(message) = panic_info.payload().downcast_ref::<&'static str>() {
+            println!("panic: {message}");
+        } else if let Some(message) = panic_info.payload().downcast_ref::<String>() {
+            println!("panic: {message}");
         } else {
             println!("panic: [mysteriously lacks a string representation]");
         }
@@ -49,9 +57,9 @@ App: {app}, Version: {ver}, Build Date: {date}, Hash: {hash}
 
         let _ = std::io::stdin().read_line(&mut String::new());
 
-        let backtrace = backtrace::Backtrace::new();
+        let backtrace = std::backtrace::Backtrace::force_capture();
 
-        println!("\n{:?}\n", backtrace);
+        println!("\n{backtrace:?}\n");
         println!("Hit Enter to continue.");
 
         let _ = std::io::stdin().read_line(&mut String::new());
@@ -61,7 +69,8 @@ App: {app}, Version: {ver}, Build Date: {date}, Hash: {hash}
 fn main() {
     setup_panic();
     console::attach();
-    let ret = std::panic::catch_unwind(gui::spawn_gui);
+
+    let ret = std::panic::catch_unwind(gui::run);
     console::free();
 
     if ret.is_err() {

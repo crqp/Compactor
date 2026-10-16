@@ -3,34 +3,47 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError};
-use filesize::PathExt;
+use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError, bounded};
 
 use crate::background::BackgroundHandle;
+use crate::compact::size_on_disk;
 use crate::compression::BackgroundCompactor;
-use crate::folder::{FileKind, FolderInfo, FolderScan};
+use crate::folder::{FileKind, FolderInfo, FolderScan, FolderSummary};
 use crate::gui::{GuiRequest, GuiWrapper};
 use crate::persistence::{config, pathdb};
 
-pub struct Backend<T> {
-    gui: GuiWrapper<T>,
+pub struct Backend {
+    gui: GuiWrapper,
     msg: Receiver<GuiRequest>,
     info: Option<FolderInfo>,
 }
 
 fn format_size(size: u64, decimal: bool) -> String {
-    use humansize::{file_size_opts as options, FileSize};
-
-    size.file_size(if decimal {
-        options::DECIMAL
-    } else {
-        options::BINARY
-    })
-    .expect("file size")
+    humansize::format_size(
+        size,
+        if decimal {
+            humansize::DECIMAL
+        } else {
+            humansize::BINARY
+        },
+    )
 }
 
-impl<T> Backend<T> {
-    pub fn new(gui: GuiWrapper<T>, msg: Receiver<GuiRequest>) -> Self {
+fn failed_text(summary: &FolderSummary) -> String {
+    if summary.failed.count > 0 {
+        format!(", {} failed", summary.failed.count)
+    } else {
+        String::new()
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn progress(done: i32, total: usize) -> f32 {
+    done as f32 / total as f32
+}
+
+impl Backend {
+    pub fn new(gui: GuiWrapper, msg: Receiver<GuiRequest>) -> Self {
         Self {
             gui,
             msg,
@@ -41,13 +54,9 @@ impl<T> Backend<T> {
     pub fn run(&mut self) {
         loop {
             match self.msg.recv() {
-                Ok(GuiRequest::ChooseFolder) => {
-                    let path = self.gui.choose_folder().recv().ok().flatten();
-
-                    if let Some(path) = path {
-                        self.gui.folder(&path);
-                        self.scan_loop(path);
-                    }
+                Ok(GuiRequest::FolderChosen(path)) => {
+                    self.gui.folder(&path);
+                    self.scan_loop(path);
                 }
                 Ok(GuiRequest::Analyse) if self.info.is_some() => {
                     let path = self.info.take().unwrap().path;
@@ -61,7 +70,7 @@ impl<T> Backend<T> {
                     self.uncompress_loop();
                 }
                 Ok(msg) => {
-                    eprintln!("Backend: Ignored message: {:?}", msg);
+                    eprintln!("Backend: Ignored message: {msg:?}");
                 }
                 Err(_) => {
                     eprintln!("Backend: exit run loop");
@@ -72,7 +81,24 @@ impl<T> Backend<T> {
     }
 
     fn scan_loop(&mut self, path: PathBuf) {
-        let excludes = config().read().unwrap().current().globset().expect("globs");
+        let excludes = match config().read().unwrap().current().globset() {
+            Ok(excludes) => excludes,
+            Err(err) => {
+                self.gui
+                    .status(format!("Invalid exclusion pattern: {err}"), None);
+                self.gui.stopped();
+                return;
+            }
+        };
+
+        if excludes.is_match(&path) {
+            self.gui.status(
+                format!("{} is excluded by the current patterns", path.display()),
+                None,
+            );
+            self.gui.stopped();
+            return;
+        }
 
         let scanner = FolderScan::new(path, excludes);
         let task = BackgroundHandle::spawn(scanner);
@@ -97,7 +123,7 @@ impl<T> Backend<T> {
                     task.cancel();
                 }
                 Ok(msg) => {
-                    eprintln!("Ignored message: {:?}", msg);
+                    eprintln!("Ignored message: {msg:?}");
                 }
                 Err(RecvTimeoutError::Timeout) => (),
             }
@@ -133,8 +159,9 @@ impl<T> Backend<T> {
     }
 
     // Ph'nglui mglw'nafh Cthulhu R'lyeh wgah'nagl fhtagn.
+    #[allow(clippy::too_many_lines)]
     fn compress_loop(&mut self) {
-        let (send_file, send_file_rx) = bounded::<(PathBuf, u64)>(1);
+        let (send_file, send_file_rx) = bounded::<PathBuf>(1);
         let (recv_result_tx, recv_result) = bounded::<(PathBuf, io::Result<bool>)>(1);
 
         let compression = Some(config().read().unwrap().current().compression);
@@ -160,11 +187,10 @@ impl<T> Backend<T> {
 
         self.gui.compacting();
 
-        self.gui.status("Compacting".to_string(), Some(0.0));
+        self.gui.status("Compacting", Some(0.0));
         loop {
             while paused && !stopped {
-                self.gui
-                    .status("Paused".to_string(), Some(done as f32 / total as f32));
+                self.gui.status("Paused", Some(progress(done, total)));
 
                 self.gui.summary(folder.summary());
 
@@ -173,21 +199,16 @@ impl<T> Backend<T> {
                         paused = true;
                     }
                     Ok(GuiRequest::Resume) => {
-                        self.gui
-                            .status("Compacting".to_string(), Some(done as f32 / total as f32));
+                        self.gui.status("Compacting", Some(progress(done, total)));
                         self.gui.resumed();
                         paused = false;
                         last_update = Instant::now();
                     }
-                    Ok(GuiRequest::Stop) => {
+                    Ok(GuiRequest::Stop) | Err(_) => {
                         stopped = true;
                         break;
                     }
                     Ok(_) => (),
-                    Err(_) => {
-                        stopped = true;
-                        break;
-                    }
                 }
             }
 
@@ -204,25 +225,58 @@ impl<T> Backend<T> {
 
             if let Some(mut fi) = folder.pop(FileKind::Compressible) {
                 send_file
-                    .send((folder.path.join(&fi.path), fi.logical_size))
+                    .send(folder.path.join(&fi.path))
                     .expect("send_file");
 
                 if !displayed && last_update.elapsed() > Duration::from_millis(50) {
                     self.gui.status(
                         format!("Compacting: {}", fi.path.display()),
-                        Some(done as f32 / total as f32),
+                        Some(progress(done, total)),
                     );
                     last_update = Instant::now();
                     displayed = true;
                 }
 
                 loop {
-                    if let Ok((path, result)) = recv_result.recv_timeout(Duration::from_millis(25))
-                    {
+                    match self.msg.try_recv() {
+                        Ok(GuiRequest::Pause) if !paused && !stopped => {
+                            self.gui.status(
+                                format!("Pausing after {}", fi.path.display()),
+                                Some(progress(done, total)),
+                            );
+                            self.gui.paused();
+                            paused = true;
+                        }
+                        Ok(GuiRequest::Resume) => {
+                            self.gui.resumed();
+                            paused = false;
+                        }
+                        Ok(GuiRequest::Stop) if !stopped => {
+                            self.gui.status(
+                                format!("Stopping after {}", fi.path.display()),
+                                Some(progress(done, total)),
+                            );
+                            stopped = true;
+                        }
+                        Ok(_) | Err(TryRecvError::Empty) => (),
+                        Err(TryRecvError::Disconnected) => {
+                            stopped = true;
+                        }
+                    }
+
+                    let received = recv_result.recv_timeout(Duration::from_millis(25));
+
+                    if let Err(RecvTimeoutError::Disconnected) = received {
+                        folder.push(FileKind::Skipped, fi);
+                        stopped = true;
+                        break;
+                    }
+
+                    if let Ok((path, result)) = received {
                         done += 1;
                         match result {
                             Ok(true) => {
-                                fi.physical_size = path.size_on_disk().unwrap_or(fi.physical_size);
+                                fi.physical_size = size_on_disk(&path).unwrap_or(fi.physical_size);
 
                                 // Irritatingly Windows can return success when it fails.
                                 if fi.physical_size == fi.logical_size {
@@ -239,9 +293,9 @@ impl<T> Backend<T> {
                             Err(err) => {
                                 self.gui.status(
                                     format!("Error: {}, {}", err, fi.path.display()),
-                                    Some(done as f32 / total as f32),
+                                    Some(progress(done, total)),
                                 );
-                                folder.push(FileKind::Skipped, fi);
+                                folder.push(FileKind::Failed, fi);
                             }
                         }
 
@@ -255,35 +309,10 @@ impl<T> Backend<T> {
                     if !displayed && last_update.elapsed() > Duration::from_millis(50) {
                         self.gui.status(
                             format!("Compacting: {}", fi.path.display()),
-                            Some(done as f32 / total as f32),
+                            Some(progress(done, total)),
                         );
 
                         displayed = true;
-                    }
-
-                    match self.msg.try_recv() {
-                        Ok(GuiRequest::Pause) if !paused => {
-                            self.gui.status(
-                                format!("Pausing after {}", fi.path.display()),
-                                Some(done as f32 / total as f32),
-                            );
-                            self.gui.paused();
-                            paused = true;
-                        }
-                        Ok(GuiRequest::Resume) => {
-                            self.gui.resumed();
-                            paused = false;
-                            stopped = false;
-                        }
-                        Ok(GuiRequest::Stop) if !stopped => {
-                            self.gui.status(
-                                format!("Stopping after {}", fi.path.display()),
-                                Some(done as f32 / total as f32),
-                            );
-                            stopped = true;
-                        }
-                        Ok(_) => (),
-                        Err(_) => (),
                     }
                 }
             } else {
@@ -300,14 +329,15 @@ impl<T> Backend<T> {
         let decimal = config().read().unwrap().current().decimal;
 
         let msg = format!(
-            "Compacted {} in {} files, saving {} in {:.2?}",
+            "Compacted {} in {} files, saving {} in {:.2?}{}",
             format_size(compressible_size, decimal),
             done,
             format_size(old_size - new_size, decimal),
-            start.elapsed()
+            start.elapsed(),
+            failed_text(&folder.summary())
         );
 
-        self.gui.status(msg, Some(done as f32 / total as f32));
+        self.gui.status(msg, Some(progress(done, total)));
         self.gui.summary(folder.summary());
         self.gui.scanned();
 
@@ -315,8 +345,9 @@ impl<T> Backend<T> {
     }
 
     // Oh no, not again.
+    #[allow(clippy::too_many_lines)]
     fn uncompress_loop(&mut self) {
-        let (send_file, send_file_rx) = bounded::<(PathBuf, u64)>(1);
+        let (send_file, send_file_rx) = bounded::<PathBuf>(1);
         let (recv_result_tx, recv_result) = bounded::<(PathBuf, io::Result<bool>)>(1);
 
         let compactor = BackgroundCompactor::new(None, send_file_rx, recv_result_tx);
@@ -335,11 +366,10 @@ impl<T> Backend<T> {
 
         self.gui.compacting();
 
-        self.gui.status("Expanding".to_string(), Some(0.0));
+        self.gui.status("Expanding", Some(0.0));
         loop {
             while paused && !stopped {
-                self.gui
-                    .status("Paused".to_string(), Some(done as f32 / total as f32));
+                self.gui.status("Paused", Some(progress(done, total)));
 
                 self.gui.summary(folder.summary());
 
@@ -348,21 +378,16 @@ impl<T> Backend<T> {
                         paused = true;
                     }
                     Ok(GuiRequest::Resume) => {
-                        self.gui
-                            .status("Expanding".to_string(), Some(done as f32 / total as f32));
+                        self.gui.status("Expanding", Some(progress(done, total)));
                         self.gui.resumed();
                         paused = false;
                         last_update = Instant::now();
                     }
-                    Ok(GuiRequest::Stop) => {
+                    Ok(GuiRequest::Stop) | Err(_) => {
                         stopped = true;
                         break;
                     }
                     Ok(_) => (),
-                    Err(_) => {
-                        stopped = true;
-                        break;
-                    }
                 }
             }
 
@@ -371,8 +396,7 @@ impl<T> Backend<T> {
             }
 
             if last_update.elapsed() > Duration::from_millis(50) {
-                self.gui
-                    .status("Expanding".to_string(), Some(done as f32 / total as f32));
+                self.gui.status("Expanding", Some(progress(done, total)));
                 last_update = Instant::now();
 
                 self.gui.summary(folder.summary());
@@ -380,13 +404,46 @@ impl<T> Backend<T> {
 
             if let Some(mut fi) = folder.pop(FileKind::Compressed) {
                 send_file
-                    .send((folder.path.join(&fi.path), fi.logical_size))
+                    .send(folder.path.join(&fi.path))
                     .expect("send_file");
 
                 let mut waiting = false;
                 loop {
-                    if let Ok((_path, result)) = recv_result.recv_timeout(Duration::from_millis(25))
-                    {
+                    match self.msg.try_recv() {
+                        Ok(GuiRequest::Pause) if !paused && !stopped => {
+                            self.gui.status(
+                                format!("Pausing after {}", fi.path.display()),
+                                Some(progress(done, total)),
+                            );
+                            self.gui.paused();
+                            paused = true;
+                        }
+                        Ok(GuiRequest::Resume) => {
+                            self.gui.resumed();
+                            paused = false;
+                        }
+                        Ok(GuiRequest::Stop) if !stopped => {
+                            self.gui.status(
+                                format!("Stopping after {}", fi.path.display()),
+                                Some(progress(done, total)),
+                            );
+                            stopped = true;
+                        }
+                        Ok(_) | Err(TryRecvError::Empty) => (),
+                        Err(TryRecvError::Disconnected) => {
+                            stopped = true;
+                        }
+                    }
+
+                    let received = recv_result.recv_timeout(Duration::from_millis(25));
+
+                    if let Err(RecvTimeoutError::Disconnected) = received {
+                        folder.push(FileKind::Skipped, fi);
+                        stopped = true;
+                        break;
+                    }
+
+                    if let Ok((_path, result)) = received {
                         done += 1;
                         match result {
                             Ok(_) => {
@@ -396,9 +453,9 @@ impl<T> Backend<T> {
                             Err(err) => {
                                 self.gui.status(
                                     format!("Error: {}, {}", err, fi.path.display()),
-                                    Some(done as f32 / total as f32),
+                                    Some(progress(done, total)),
                                 );
-                                folder.push(FileKind::Skipped, fi);
+                                folder.push(FileKind::Failed, fi);
                             }
                         }
 
@@ -408,36 +465,11 @@ impl<T> Backend<T> {
                     if !waiting && last_update.elapsed() > Duration::from_millis(50) {
                         self.gui.status(
                             format!("Expanding: {}", fi.path.display()),
-                            Some(done as f32 / total as f32),
+                            Some(progress(done, total)),
                         );
 
                         last_update = Instant::now();
                         waiting = true;
-                    }
-
-                    match self.msg.try_recv() {
-                        Ok(GuiRequest::Pause) if !paused => {
-                            self.gui.status(
-                                format!("Pausing after {}", fi.path.display()),
-                                Some(done as f32 / total as f32),
-                            );
-                            self.gui.paused();
-                            paused = true;
-                        }
-                        Ok(GuiRequest::Resume) => {
-                            self.gui.resumed();
-                            paused = false;
-                            stopped = false;
-                        }
-                        Ok(GuiRequest::Stop) if !stopped => {
-                            self.gui.status(
-                                format!("Stopping after {}", fi.path.display()),
-                                Some(done as f32 / total as f32),
-                            );
-                            stopped = true;
-                        }
-                        Ok(_) => (),
-                        Err(_) => (),
                     }
                 }
             } else {
@@ -451,16 +483,17 @@ impl<T> Backend<T> {
         let new_size = folder.physical_size;
 
         let msg = format!(
-            "Expanded {} files wasting {} in {:.2?}",
+            "Expanded {} files wasting {} in {:.2?}{}",
             done,
             format_size(
                 new_size - old_size,
                 config().read().unwrap().current().decimal
             ),
-            start.elapsed()
+            start.elapsed(),
+            failed_text(&folder.summary())
         );
 
-        self.gui.status(msg, Some(done as f32 / total as f32));
+        self.gui.status(msg, Some(progress(done, total)));
         self.gui.summary(folder.summary());
         self.gui.scanned();
 

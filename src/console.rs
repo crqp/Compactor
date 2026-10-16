@@ -7,8 +7,9 @@
 // These functions enable that, primarily for the purposes of displaying Rust
 // panics.
 
-use winapi::um::consoleapi::AllocConsole;
-use winapi::um::wincon::{AttachConsole, FreeConsole, GetConsoleWindow, ATTACH_PARENT_PROCESS};
+use windows_sys::Win32::System::Console::{
+    ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole, FreeConsole, GetConsoleWindow,
+};
 
 /// Check if we're attached to an existing Windows console
 pub fn is_attached() -> bool {

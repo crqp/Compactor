@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.11.0 - 2026-10-15
+
+Sorry.
+
+### Changed
+
+- Rewrite the GUI in Rust using egui and eframe, replacing the HTML/JS front
+  end and the unmaintained web-view dependency
+- Replace the web-view, wfd, tinyfiledialogs and dirs-sys dependencies with eframe and rfd
+- Migrate from winapi to windows-sys
+- Update all remaining dependencies and move to the 2024 edition
+- Use the standard library's file locking instead of the fs2 crate
+- Replace the unmaintained filesize crate with a direct `GetCompressedFileSizeW` call
+- Replace the backtrace crate with `std::backtrace`
+- Replace lazy_static with `std::sync::LazyLock`
+- Replace tempdir with tempfile in tests
+
+### Fixed
+
+- Report `DeviceIoControl` failures instead of treating every result as a success, so incompressible and unbacked files are now handled correctly
+
+### Removed
+
+- Unused glob dependency
+
 ## [0.10.1] - 2020-12-22
 
 ### Fixed

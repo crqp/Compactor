@@ -3,33 +3,32 @@ use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use filesize::PathExt;
 use globset::GlobSet;
-use serde_derive::Serialize;
 use walkdir::WalkDir;
-use winapi::um::winnt::{
+use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
     FILE_ATTRIBUTE_TEMPORARY,
 };
 
 use crate::background::{Background, ControlToken};
+use crate::compact::{self, size_on_disk};
 use crate::persistence::pathdb;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct FileInfo {
     pub path: PathBuf,
     pub logical_size: u64,
     pub physical_size: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct GroupInfo {
     pub files: VecDeque<FileInfo>,
     pub logical_size: u64,
     pub physical_size: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct FolderInfo {
     pub path: PathBuf,
     pub logical_size: u64,
@@ -37,18 +36,20 @@ pub struct FolderInfo {
     pub compressible: GroupInfo,
     pub compressed: GroupInfo,
     pub skipped: GroupInfo,
+    pub failed: GroupInfo,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct FolderSummary {
     pub logical_size: u64,
     pub physical_size: u64,
     pub compressible: GroupSummary,
     pub compressed: GroupSummary,
     pub skipped: GroupSummary,
+    pub failed: GroupSummary,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct GroupSummary {
     pub count: usize,
     pub logical_size: u64,
@@ -60,6 +61,7 @@ pub enum FileKind {
     Compressed,
     Compressible,
     Skipped,
+    Failed,
 }
 
 impl FolderInfo {
@@ -71,6 +73,7 @@ impl FolderInfo {
             compressible: GroupInfo::default(),
             compressed: GroupInfo::default(),
             skipped: GroupInfo::default(),
+            failed: GroupInfo::default(),
         }
     }
 
@@ -81,14 +84,16 @@ impl FolderInfo {
             compressible: self.compressible.summary(),
             compressed: self.compressed.summary(),
             skipped: self.skipped.summary(),
+            failed: self.failed.summary(),
         }
     }
 
-    pub fn len(&mut self, kind: FileKind) -> usize {
+    pub fn len(&self, kind: FileKind) -> usize {
         match kind {
             FileKind::Compressible => self.compressible.files.len(),
             FileKind::Compressed => self.compressed.files.len(),
             FileKind::Skipped => self.skipped.files.len(),
+            FileKind::Failed => self.failed.files.len(),
         }
     }
 
@@ -97,6 +102,7 @@ impl FolderInfo {
             FileKind::Compressible => self.compressible.pop(),
             FileKind::Compressed => self.compressed.pop(),
             FileKind::Skipped => self.skipped.pop(),
+            FileKind::Failed => self.failed.pop(),
         };
 
         if let Some(fi) = ret {
@@ -117,7 +123,8 @@ impl FolderInfo {
             FileKind::Compressible => self.compressible.push(fi),
             FileKind::Compressed => self.compressed.push(fi),
             FileKind::Skipped => self.skipped.push(fi),
-        };
+            FileKind::Failed => self.failed.push(fi),
+        }
     }
 }
 
@@ -187,14 +194,17 @@ impl Background for FolderScan {
         // 5. GetCompressedFileSizeW() or skip.
         let walker = WalkDir::new(&path)
             .into_iter()
-            .filter_entry(|e| e.file_type().is_file() || !excludes.is_match(e.path()))
-            .filter_map(|e| e.map_err(|e| eprintln!("Error: {:?}", e)).ok())
-            .filter(|e| e.file_type().is_file())
-            .filter_map(|e| e.metadata().map(|md| (e, md)).ok())
-            .filter_map(|(e, md)| e.path().size_on_disk().map(|s| (e, md, s)).ok())
-            .enumerate();
+            .filter_entry(|entry| entry.file_type().is_file() || !excludes.is_match(entry.path()))
+            .filter_map(|result| result.map_err(|error| eprintln!("Error: {error:?}")).ok())
+            .filter(|entry| entry.file_type().is_file())
+            .filter_map(|entry| entry.metadata().map(|metadata| (entry, metadata)).ok())
+            .filter_map(|(entry, metadata)| {
+                size_on_disk(entry.path())
+                    .map(|size| (entry, metadata, size))
+                    .ok()
+            });
 
-        for (count, (entry, metadata, physical)) in walker {
+        for (entry, metadata, physical) in walker {
             let shortname = entry
                 .path()
                 .strip_prefix(&path)
@@ -207,19 +217,25 @@ impl Background for FolderScan {
                 physical_size: physical,
             };
 
-            if count % 8 == 0 {
-                if control.is_cancelled_with_pause() {
-                    return Err(ds);
-                }
+            if control.is_cancelled_with_pause() {
+                return Err(ds);
+            }
 
-                if last_status.elapsed() >= Duration::from_millis(50) {
-                    last_status = Instant::now();
-                    control.set_status((fi.path.clone(), ds.summary()));
-                }
+            if last_status.elapsed() >= Duration::from_millis(50) {
+                last_status = Instant::now();
+                control.set_status((fi.path.clone(), ds.summary()));
             }
 
             if fi.physical_size < fi.logical_size {
-                ds.push(FileKind::Compressed, fi);
+                // Only externally backed files can be decompressed again, while
+                // legacy NTFS compression and sparse files cannot.
+                if compact::detect_compression(entry.path())
+                    .is_ok_and(|compression| compression.is_some())
+                {
+                    ds.push(FileKind::Compressed, fi);
+                } else {
+                    ds.push(FileKind::Skipped, fi);
+                }
             } else if fi.logical_size <= 4096
                 || metadata.file_attributes()
                     & (FILE_ATTRIBUTE_READONLY
@@ -256,11 +272,11 @@ fn it_walks() {
         let ret = task.wait_timeout(Duration::from_millis(100));
 
         if ret.is_some() {
-            println!("Scanned: {:?}", ret);
+            println!("Scanned: {ret:?}");
             break;
-        } else {
-            println!("Status: {:?}", task.status());
         }
+
+        println!("Status: {:?}", task.status());
 
         if Instant::now() > deadline {
             task.cancel();

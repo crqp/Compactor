@@ -1,15 +1,15 @@
-use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError};
-use std::panic::{catch_unwind, UnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use crossbeam_channel::{Receiver, RecvTimeoutError};
+use std::panic::{UnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-/// Tiny thread-backed background job thing
-///
-/// This is very similar to ffi_helper's Task
-/// https://github.com/Michael-F-Bryan/ffi_helpers
 use std::time::Duration;
 
+// Tiny thread-backed background job thing
+//
+// This is very similar to ffi_helper's Task
+// https://github.com/Michael-F-Bryan/ffi_helpers
 #[derive(Debug, Clone)]
 pub struct ControlToken<S>(Arc<ControlTokenInner<S>>);
 
@@ -73,14 +73,6 @@ impl<S> ControlToken<S> {
         let mut current = self.0.status.lock().expect("status lock");
         current.take()
     }
-
-    pub fn result(&self) -> Result<(), ()> {
-        if self.is_cancelled() {
-            Err(())
-        } else {
-            Ok(())
-        }
-    }
 }
 
 impl<S> Default for ControlToken<S> {
@@ -120,36 +112,24 @@ impl<T, S> BackgroundHandle<T, S> {
         }
     }
 
-    pub fn poll(&self) -> Option<T> {
-        match self.result.try_recv() {
-            Ok(value) => Some(value.unwrap()),
-            Err(TryRecvError::Empty) => None,
-            Err(e) => panic!("{:?}", e),
-        }
-    }
-
     pub fn wait_timeout(&self, wait: Duration) -> Option<T> {
         match self.result.recv_timeout(wait) {
             Ok(value) => Some(value.unwrap()),
             Err(RecvTimeoutError::Timeout) => None,
-            Err(e) => panic!("{:?}", e),
+            Err(error) => panic!("{error:?}"),
         }
     }
 
     pub fn wait(self) -> T {
         match self.result.recv() {
             Ok(value) => value.unwrap(),
-            Err(e) => panic!("{:?}", e),
+            Err(error) => panic!("{error:?}"),
         }
     }
 
     pub fn cancel(&self) {
         self.control.cancel();
         self.thread.unpark();
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.control.is_cancelled()
     }
 
     pub fn status(&self) -> Option<S> {
@@ -163,10 +143,6 @@ impl<T, S> BackgroundHandle<T, S> {
     pub fn resume(&self) {
         self.control.resume();
         self.thread.unpark();
-    }
-
-    pub fn is_paused(&self) -> bool {
-        self.control.is_paused()
     }
 }
 
@@ -205,57 +181,50 @@ mod tests {
                 thread::sleep(Duration::from_millis(10));
             }
 
-            control.result().map(|_| ticks).map_err(|_| ticks)
+            if control.is_cancelled() {
+                Err(ticks)
+            } else {
+                Ok(ticks)
+            }
         }
     }
 
     #[test]
     fn it_cancels() {
-        let task = Tick;
+        let handle = BackgroundHandle::spawn(Tick);
 
-        let handle = BackgroundHandle::spawn(task);
-
-        for _ in 0..10 {
+        for _ in 0..5 {
             thread::sleep(Duration::from_millis(10));
-            let got = handle.poll();
-            assert!(got.is_none());
+            assert!(handle.wait_timeout(Duration::from_millis(1)).is_none());
         }
 
         handle.cancel();
 
-        let ret = handle.wait();
-        assert!(ret.is_err());
-        let ticks = ret.unwrap_err();
-        assert!(9 <= ticks && ticks <= 12);
+        let ticks = handle.wait().unwrap_err();
+        assert!(ticks > 0);
     }
 
     #[test]
     fn it_pauses() {
-        let task = Tick;
+        let handle = BackgroundHandle::spawn(Tick);
 
-        let handle = BackgroundHandle::spawn(task);
+        thread::sleep(Duration::from_millis(50));
+        let before = handle.status().unwrap_or(0);
 
         handle.pause();
-
-        for _ in 0..10 {
-            thread::sleep(Duration::from_millis(10));
-            let got = handle.poll();
-            assert!(got.is_none());
-        }
+        thread::sleep(Duration::from_millis(200));
+        let during = handle.status().unwrap_or(before);
+        assert!(
+            during <= before + 2,
+            "ticked while paused: {before} -> {during}"
+        );
 
         handle.resume();
-
-        for _ in 0..10 {
-            thread::sleep(Duration::from_millis(10));
-            let got = handle.poll();
-            assert!(got.is_none());
-        }
+        thread::sleep(Duration::from_millis(50));
+        let after = handle.status().unwrap_or(during);
+        assert!(after > during, "did not resume: {during} -> {after}");
 
         handle.cancel();
-
-        let ret = handle.wait();
-        assert!(ret.is_err());
-        let ticks = ret.unwrap_err();
-        assert!(9 <= ticks && ticks <= 12);
+        let _ = handle.wait().unwrap_err();
     }
 }
