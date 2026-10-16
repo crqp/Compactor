@@ -6,8 +6,7 @@ Sorry.
 
 ### Changed
 
-- Rewrite the GUI in Rust using egui and eframe, replacing the HTML/JS front
-  end and the unmaintained web-view dependency
+- Rewrite the GUI in Rust using egui and eframe, replacing the HTML/JS front end and the unmaintained web-view dependency
 - Replace the web-view, wfd, tinyfiledialogs and dirs-sys dependencies with eframe and rfd
 - Migrate from winapi to windows-sys
 - Update all remaining dependencies and move to the 2024 edition
